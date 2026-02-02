@@ -1,116 +1,271 @@
 from __future__ import annotations
 
 import argparse
-import datetime as dt
-import math
+import json
+import random
 import re
 import time
-from typing import Any, Iterable
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import httpx
 from sqlalchemy import text
 
-from core.settings import settings
 from core.db import engine
 
-ODATA_BASE = settings.ifdata_odata_base.rstrip("/")
 
-VALORES_ENTITYSET_URL = f"{ODATA_BASE}/IfDataValores"
-VALORES_FUNCTION_URL = (
-    f"{ODATA_BASE}/IfDataValores(AnoMes=@AnoMes,TipoInstituicao=@TipoInstituicao,Relatorio=@Relatorio)"
-)
-CADASTRO_FUNCTION_URL = f"{ODATA_BASE}/IfDataCadastro(AnoMes=@AnoMes)"
+# -----------------------------
+# Config / Endpoints
+# -----------------------------
+ODATA_DEFAULT = "https://olinda.bcb.gov.br/olinda/servico/IFDATA/versao/v1/odata"
 
-
-def _last_day_of_month(year: int, month: int) -> dt.date:
-    if month == 12:
-        return dt.date(year, 12, 31)
-    return dt.date(year, month + 1, 1) - dt.timedelta(days=1)
+CADASTRO_URL = "{base}/IfDataCadastro"
+VALORES_FUNCTION_URL = "{base}/IfDataValores(AnoMes=@AnoMes,TipoInstituicao=@TipoInstituicao,Relatorio=@Relatorio)"
 
 
-def anomes_to_ref_date(anomes: int) -> str:
-    year = anomes // 100
-    month = anomes % 100
-    return _last_day_of_month(year, month).isoformat()
+# -----------------------------
+# Utils: strings / normalization
+# -----------------------------
+_RE_SPACES = re.compile(r"\s+")
+_RE_CTRL = re.compile(r"[\x00-\x1F\x7F]+")
 
-
-def _is_number(x: Any) -> bool:
-    if isinstance(x, bool):
-        return False
-    if isinstance(x, (int, float)):
-        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
-            return False
-        return True
-    if isinstance(x, str):
-        s = x.strip().replace(".", "").replace(",", ".")
-        if re.fullmatch(r"-?\d+(\.\d+)?", s):
-            try:
-                v = float(s)
-                return not (math.isnan(v) or math.isinf(v))
-            except Exception:
-                return False
-    return False
-
-
-def _to_float(x: Any) -> float:
-    if isinstance(x, bool):
-        raise ValueError("bool não é número válido")
-    if isinstance(x, (int, float)):
-        return float(x)
-    if isinstance(x, str):
-        s = x.strip().replace(".", "").replace(",", ".")
-        return float(s)
-    raise ValueError(f"Não consegui converter para float: {x!r}")
-
-
-def clean_indicator_name(s: str) -> str:
-    s = (s or "").replace("\r", " ").replace("\n", " ")
-    s = re.sub(r"\s+", " ", s).strip()
+def clean_text(s: str) -> str:
+    """Remove controles, normaliza whitespace e trims."""
+    s = _RE_CTRL.sub(" ", s)
+    s = s.replace("\r", " ").replace("\n", " ")
+    s = _RE_SPACES.sub(" ", s).strip()
     return s
 
+def clean_indicator_name(s: str) -> str:
+    """
+    Nome do indicador vem em NomeColuna / DescricaoColuna e pode ter fórmulas,
+    quebras de linha etc. A gente limpa pra ficar estável.
+    """
+    s = clean_text(s)
+    # remove espaços em torno de "=" e símbolos
+    s = re.sub(r"\s*=\s*", " = ", s)
+    s = _RE_SPACES.sub(" ", s).strip()
+    return s
 
-def odata_get(url: str, params: dict[str, Any], timeout_s: float = 30.0, tries: int = 4) -> dict:
+def safe_trunc(s: str, max_len: int) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 1] + "…"
+
+def parse_ref_date_from_anomes(anomes: int) -> date:
+    """
+    IF.data usa AnoMes no formato YYYYMM.
+    A ref_date do projeto normalmente é o último dia do mês.
+    """
+    y = anomes // 100
+    m = anomes % 100
+    if m == 12:
+        next_month = date(y + 1, 1, 1)
+    else:
+        next_month = date(y, m + 1, 1)
+    return next_month.fromordinal(next_month.toordinal() - 1)
+
+def to_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        # Olinda às vezes manda número como string
+        if isinstance(x, str):
+            x = x.strip()
+            if x == "":
+                return None
+            x = x.replace(".", "").replace(",", ".") if "," in x else x
+        return float(x)
+    except Exception:
+        return None
+
+
+# -----------------------------
+# HTTP client with resilience
+# -----------------------------
+def odata_get(
+    url: str,
+    params: Dict[str, Any],
+    timeout_s: float = 90.0,
+    tries: int = 8,
+) -> Dict[str, Any]:
+    """
+    GET resiliente para Olinda/IF.data:
+    - timeout separado (connect/read/write/pool)
+    - retry com backoff exponencial + jitter
+    - trata 429/5xx/timeouts/transientes
+    """
     last_err: Exception | None = None
+
+    timeout = httpx.Timeout(
+        connect=min(10.0, timeout_s),
+        read=max(30.0, timeout_s),   # read é o gargalo
+        write=min(10.0, timeout_s),
+        pool=min(10.0, timeout_s),
+    )
+
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "risk-bank-ingest/1.0",
+    }
+
     for attempt in range(1, tries + 1):
         try:
-            with httpx.Client(timeout=timeout_s, headers={"Accept": "application/json"}) as client:
+            with httpx.Client(timeout=timeout, headers=headers, follow_redirects=True) as client:
                 r = client.get(url, params=params)
+
+                # rate limit
+                if r.status_code == 429:
+                    ra = r.headers.get("Retry-After")
+                    sleep_s = float(ra) if (ra and ra.isdigit()) else min(60.0, 2.0 * attempt)
+                    time.sleep(sleep_s)
+                    continue
+
+                # 5xx transitório
+                if 500 <= r.status_code <= 599:
+                    raise httpx.HTTPStatusError(
+                        f"{r.status_code} server error", request=r.request, response=r
+                    )
+
                 r.raise_for_status()
                 return r.json()
+
+        except (httpx.ReadTimeout, httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError) as e:
+            last_err = e
+        except httpx.HTTPStatusError as e:
+            last_err = e
         except Exception as e:
             last_err = e
-            time.sleep(1.25 * attempt)
+
+        # backoff exponencial + jitter
+        base = min(2 ** attempt, 60)
+        jitter = random.uniform(0.4, 1.3)
+        time.sleep(base * jitter)
+
     raise RuntimeError(f"Falha no GET {url} params={params}. Último erro: {last_err}") from last_err
 
 
-def candidate_anomes_from_today(n_quarters: int = 16) -> list[int]:
-    today = dt.date.today()
-    quarter_months = [12, 9, 6, 3]
-    m = max([qm for qm in quarter_months if qm <= today.month] or [12])
-    y = today.year
-    if today.month < 3:
-        y = today.year - 1
-        m = 12
+# -----------------------------
+# Checkpoint (resume)
+# -----------------------------
+@dataclass
+class Checkpoint:
+    anomes: int
+    tipo: int
+    rel: str
+    top: int
+    skip: int
+    updated_at: str
 
-    out: list[int] = []
-    cur_y, cur_m = y, m
-    for _ in range(n_quarters):
-        out.append(cur_y * 100 + cur_m)
-        if cur_m == 12:
-            cur_m = 9
-        elif cur_m == 9:
-            cur_m = 6
-        elif cur_m == 6:
-            cur_m = 3
-        else:
-            cur_m = 12
-            cur_y -= 1
-    return out
+def load_state(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_state(path: Path, state: Dict[str, Any]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+def state_key(anomes: int, tipo: int, rel: str) -> str:
+    return f"{anomes}:{tipo}:{rel}"
+
+def get_checkpoint(state: Dict[str, Any], anomes: int, tipo: int, rel: str) -> Optional[Checkpoint]:
+    k = state_key(anomes, tipo, rel)
+    v = state.get(k)
+    if not isinstance(v, dict):
+        return None
+    try:
+        return Checkpoint(
+            anomes=int(v["anomes"]),
+            tipo=int(v["tipo"]),
+            rel=str(v["rel"]),
+            top=int(v.get("top", 0)),
+            skip=int(v.get("skip", 0)),
+            updated_at=str(v.get("updated_at", "")),
+        )
+    except Exception:
+        return None
+
+def set_checkpoint(state: Dict[str, Any], cp: Checkpoint) -> None:
+    k = state_key(cp.anomes, cp.tipo, cp.rel)
+    state[k] = {
+        "anomes": cp.anomes,
+        "tipo": cp.tipo,
+        "rel": cp.rel,
+        "top": cp.top,
+        "skip": cp.skip,
+        "updated_at": cp.updated_at,
+    }
 
 
-def iter_valores_function(anomes: int, tipo: int, rel: str, top: int, timeout_s: float) -> Iterable[dict[str, Any]]:
+# -----------------------------
+# IF.data iterators
+# -----------------------------
+def iter_cadastro(anomes: int, tipo: int, base: str, timeout_s: float) -> Iterator[Dict[str, Any]]:
+    """
+    Cadastro: queremos CodInst e Nome.
+    Observação: o cadastro pode ter mais de um AnoMes; mas na prática
+    dá pra filtrar AnoMes e TipoInstituicao.
+    """
+    url = CADASTRO_URL.format(base=base)
+    top = 10000
     skip = 0
-    rel_clean = str(rel).strip().replace("'", "")
+
+    while True:
+        params = {
+            "$format": "json",
+            "$top": top,
+            "$skip": skip,
+            "$select": "AnoMes,CodInst,Nome,TipoInstituicao",
+            "$filter": f"AnoMes eq {anomes} and TipoInstituicao eq {tipo}",
+        }
+        data = odata_get(url, params=params, timeout_s=timeout_s)
+        rows = data.get("value", []) or []
+        if not rows:
+            break
+        for r in rows:
+            yield r
+        skip += len(rows)
+        if len(rows) < top:
+            break
+
+def build_cadastro_map(anomes: int, tipo: int, base: str, timeout_s: float) -> Dict[str, str]:
+    print("==> Carregando cadastro (CodInst -> Nome)...")
+    cmap: Dict[str, str] = {}
+    for r in iter_cadastro(anomes=anomes, tipo=tipo, base=base, timeout_s=timeout_s):
+        cod = str(r.get("CodInst") or "").strip()
+        nome = clean_text(str(r.get("Nome") or ""))
+        if cod:
+            cmap[cod] = nome
+    print(f"    cadastro_map size: {len(cmap)}")
+    return cmap
+
+
+def iter_ifdata_valores_pages(
+    anomes: int,
+    tipo: int,
+    rel: str,
+    base: str,
+    top: int,
+    start_skip: int,
+    timeout_s: float,
+) -> Iterator[Tuple[int, List[Dict[str, Any]]]]:
+    """
+    Itera páginas do endpoint function IfDataValores(...) com paginação $skip/$top.
+    Retorna (skip_atual, rows_da_pagina).
+    """
+    url = VALORES_FUNCTION_URL.format(base=base)
+
+    skip = start_skip
     while True:
         params = {
             "$format": "json",
@@ -118,227 +273,274 @@ def iter_valores_function(anomes: int, tipo: int, rel: str, top: int, timeout_s:
             "$skip": skip,
             "@AnoMes": anomes,
             "@TipoInstituicao": tipo,
-            "@Relatorio": f"'{rel_clean}'",
+            "@Relatorio": f"'{rel}'",  # precisa ir com aspas simples
         }
-        data = odata_get(VALORES_FUNCTION_URL, params=params, timeout_s=timeout_s)
-        rows = data.get("value", [])
+        data = odata_get(url, params=params, timeout_s=timeout_s)
+        rows = data.get("value", []) or []
+        yield (skip, rows)
+
         if not rows:
             break
-        for row in rows:
-            yield row
+        skip += len(rows)
         if len(rows) < top:
             break
-        skip += top
 
 
-def iter_valores_filter(anomes: int, tipo: int, rel: str, top: int, timeout_s: float) -> Iterable[dict[str, Any]]:
-    rel_clean = str(rel).strip().replace("'", "")
-    filters = [
-        f"AnoMes eq {anomes} and TipoInstituicao eq {tipo} and NumeroRelatorio eq {rel_clean}",
-        f"AnoMes eq {anomes} and TipoInstituicao eq {tipo} and NumeroRelatorio eq '{rel_clean}'",
-        f"AnoMes eq {anomes} and TipoInstituicao eq {tipo} and Relatorio eq {rel_clean}",
-        f"AnoMes eq {anomes} and TipoInstituicao eq {tipo} and Relatorio eq '{rel_clean}'",
-    ]
-    for fexpr in filters:
-        skip = 0
-        got_any = False
-        while True:
-            data = odata_get(
-                VALORES_ENTITYSET_URL,
-                params={"$format": "json", "$top": top, "$skip": skip, "$filter": fexpr},
-                timeout_s=timeout_s,
-            )
-            rows = data.get("value", [])
-            if not rows:
-                break
-            got_any = True
-            for row in rows:
-                yield row
-            if len(rows) < top:
-                break
-            skip += top
-        if got_any:
-            return
+# -----------------------------
+# DB upsert
+# -----------------------------
+UPSERT_SQL = text("""
+  INSERT INTO ifdata_indicators
+    (ref_date, institution_id, institution_name, indicator, value)
+  VALUES
+    (:ref_date, :institution_id, :institution_name, :indicator, :value)
+  ON CONFLICT (ref_date, institution_id, indicator)
+  DO UPDATE SET
+    value = EXCLUDED.value,
+    institution_name = EXCLUDED.institution_name
+""")
 
-
-def iter_ifdata_valores(anomes: int, tipo: int, rel: str, top: int, timeout_s: float) -> Iterable[dict[str, Any]]:
-    any_row = False
-    for row in iter_valores_function(anomes, tipo, rel, top, timeout_s):
-        any_row = True
-        yield row
-    if any_row:
-        return
-    for row in iter_valores_filter(anomes, tipo, rel, top, timeout_s):
-        yield row
-
-
-def load_cadastro_map(anomes: int, timeout_s: float) -> dict[str, str]:
-    params = {
-        "$format": "json",
-        "$top": 200000,
-        "@AnoMes": anomes,
-    }
-    data = odata_get(CADASTRO_FUNCTION_URL, params=params, timeout_s=timeout_s)
-    rows = data.get("value", [])
-
-    out: dict[str, str] = {}
-    id_keys = ["CodInst", "CodIF", "CodIf", "CodInstituicao", "CodigoInstituicao", "CodConglomerado", "CodCong"]
-    name_keys = ["NomeInstituicao", "Nome", "NomeIF", "NomeIf", "NomeConglomerado", "NomeCong"]
-
-    for r in rows:
-        cid = None
-        for k in id_keys:
-            if k in r and r[k] not in (None, ""):
-                cid = str(r[k]).strip()
-                break
-        if not cid:
-            continue
-        cname = None
-        for k in name_keys:
-            if k in r and r[k] not in (None, ""):
-                cname = str(r[k]).strip()
-                break
-        if cname:
-            out[cid] = cname
-
-    return out
-
-
-def find_working_anomes(relatorio: str, top: int, timeout_s: float, tipos: list[int] = [1, 2, 3, 4], n_quarters: int = 16):
-    for anomes in candidate_anomes_from_today(n_quarters=n_quarters):
-        for tipo in tipos:
-            got = False
-            for _ in iter_valores_function(anomes=anomes, tipo=tipo, rel=relatorio, top=min(5, top), timeout_s=timeout_s):
-                got = True
-                break
-            if got:
-                return anomes, tipo
-    return None
-
-
-def upsert_batch_long(batch: list[dict[str, Any]]) -> int:
+def upsert_batch(batch: List[Dict[str, Any]]) -> int:
     if not batch:
         return 0
-    stmt = text(
-        """
-        INSERT INTO ifdata_indicators (ref_date, institution_id, institution_name, indicator, value)
-        VALUES (:ref_date, :institution_id, :institution_name, :indicator, :value)
-        ON CONFLICT (ref_date, institution_id, indicator)
-        DO UPDATE SET
-          value = EXCLUDED.value,
-          institution_name = EXCLUDED.institution_name
-        """
-    )
     with engine.begin() as conn:
-        conn.execute(stmt, batch)
+        conn.execute(UPSERT_SQL, batch)
     return len(batch)
 
 
-def run(anomes: int, tipo: int, relatorios: list[str], top: int, timeout_s: float, chunk: int, debug_sample: bool) -> None:
-    ref_date = anomes_to_ref_date(anomes)
-    print(f"==> Ingest IF.data: AnoMes={anomes} ref_date={ref_date} tipo={tipo} relatorios={relatorios}")
-    print(f"ODATA_BASE={ODATA_BASE}")
+# -----------------------------
+# Main ingest logic
+# -----------------------------
+def ingest_relatorio(
+    anomes: int,
+    ref_date: date,
+    tipo: int,
+    rel: str,
+    base: str,
+    timeout_s: float,
+    top_initial: int,
+    cadastro_map: Dict[str, str],
+    state_path: Path,
+    resume: bool,
+    commit_every: int = 10_000,
+    indicator_max_len: int = 220,
+    name_max_len: int = 160,
+) -> int:
+    """
+    Ingest de um relatório com checkpoint + fallback de page size.
+    Retorna total de registros upsertados.
+    """
 
-    print("==> Carregando cadastro (CodInst -> Nome)...")
-    cadastro_map = load_cadastro_map(anomes=anomes, timeout_s=timeout_s)
-    print(f"    cadastro_map size: {len(cadastro_map)}")
+    # estratégia recomendada: começar com top menor e estável
+    # (1000 costuma ser bom; se falhar, desce)
+    top_candidates = [top_initial, 2000, 1000, 500, 200, 100]
+    top_candidates = [t for t in top_candidates if t > 0]
+    # remove duplicados mantendo ordem
+    top_candidates = list(dict.fromkeys(top_candidates))
 
-    total = 0
+    # checkpoint
+    state = load_state(state_path)
+    cp = get_checkpoint(state, anomes, tipo, rel) if resume else None
+    start_skip = cp.skip if cp else 0
 
-    for rel in relatorios:
-        print(f"\n--- Relatório {rel} ---")
-        batch: list[dict[str, Any]] = []
-        row_count = 0
-        inst_seen: set[str] = set()
-        sample_printed = False
+    total_upserted = 0
+    total_rows_downloaded = 0
+    institutions_seen: set[str] = set()
 
-        for row in iter_ifdata_valores(anomes=anomes, tipo=tipo, rel=rel, top=top, timeout_s=timeout_s):
-            row_count += 1
+    last_error: Optional[Exception] = None
 
-            if debug_sample and not sample_printed:
-                print("SAMPLE ROW KEYS:", sorted(row.keys()))
-                print("SAMPLE ROW:", row)
-                sample_printed = True
+    for top in top_candidates:
+        try:
+            batch: List[Dict[str, Any]] = []
 
-            inst_id = row.get("CodInst")
-            nome_coluna = row.get("NomeColuna")
-            saldo = row.get("Saldo")
-            num_rel = row.get("NumeroRelatorio") or rel
+            # se estamos mudando top e já tinha checkpoint, continua do skip salvo
+            # (skip é “offset de linha”, independente do top)
+            for (skip_at, rows) in iter_ifdata_valores_pages(
+                anomes=anomes,
+                tipo=tipo,
+                rel=rel,
+                base=base,
+                top=top,
+                start_skip=start_skip,
+                timeout_s=timeout_s,
+            ):
+                if not rows:
+                    # salva checkpoint final (fim)
+                    state = load_state(state_path)
+                    set_checkpoint(
+                        state,
+                        Checkpoint(
+                            anomes=anomes,
+                            tipo=tipo,
+                            rel=rel,
+                            top=top,
+                            skip=skip_at,
+                            updated_at=datetime.utcnow().isoformat(),
+                        ),
+                    )
+                    save_state(state_path, state)
+                    break
 
-            if not inst_id or not nome_coluna or saldo is None:
-                continue
-            if not _is_number(saldo):
-                continue
+                total_rows_downloaded += len(rows)
 
-            inst_id = str(inst_id).strip()
-            inst_name = cadastro_map.get(inst_id, "")
+                for r in rows:
+                    # chaves observadas: AnoMes, CodInst, Conta, DescricaoColuna, Grupo, NomeColuna, NomeRelatorio, NumeroRelatorio, Saldo, TipoInstituicao
+                    codinst = str(r.get("CodInst") or "").strip()
+                    nome_inst = cadastro_map.get(codinst) or clean_text(str(r.get("NomeInstituicao") or "")) or ""
 
-            indicator = f"{num_rel}::{clean_indicator_name(str(nome_coluna))}"
-            value = _to_float(saldo)
+                    # Indicador (prefixo do relatório + nome limpo)
+                    nome_coluna = r.get("NomeColuna") or r.get("DescricaoColuna") or ""
+                    indicator = f"{rel}::{clean_indicator_name(str(nome_coluna))}"
 
-            inst_seen.add(inst_id)
+                    # valor
+                    val = to_float(r.get("Saldo"))
 
-            batch.append(
-                {
-                    "ref_date": ref_date,
-                    "institution_id": inst_id,
-                    "institution_name": inst_name,
-                    "indicator": indicator,
-                    "value": value,
-                }
-            )
+                    if not codinst or indicator.strip() == f"{rel}::":
+                        continue
 
-            if len(batch) >= chunk:
-                n = upsert_batch_long(batch)
-                total += n
-                print(f"  upsert +{n} (total={total})")
+                    institutions_seen.add(codinst)
+
+                    item = {
+                        "ref_date": str(ref_date),
+                        "institution_id": codinst,
+                        "institution_name": safe_trunc(nome_inst, name_max_len),
+                        "indicator": safe_trunc(indicator, indicator_max_len),
+                        "value": val,
+                    }
+                    batch.append(item)
+
+                    if len(batch) >= commit_every:
+                        total_upserted += upsert_batch(batch)
+                        batch.clear()
+
+                        # checkpoint: salva “até onde chegamos” (skip_at + rows processadas)
+                        # Como estamos executando pagina inteira, salvamos o skip da página atual.
+                        state = load_state(state_path)
+                        set_checkpoint(
+                            state,
+                            Checkpoint(
+                                anomes=anomes,
+                                tipo=tipo,
+                                rel=rel,
+                                top=top,
+                                skip=skip_at,
+                                updated_at=datetime.utcnow().isoformat(),
+                            ),
+                        )
+                        save_state(state_path, state)
+
+                # checkpoint por página (ao final de cada página)
+                state = load_state(state_path)
+                set_checkpoint(
+                    state,
+                    Checkpoint(
+                        anomes=anomes,
+                        tipo=tipo,
+                        rel=rel,
+                        top=top,
+                        skip=skip_at + len(rows),
+                        updated_at=datetime.utcnow().isoformat(),
+                    ),
+                )
+                save_state(state_path, state)
+
+            # flush final
+            if batch:
+                total_upserted += upsert_batch(batch)
                 batch.clear()
 
-        if batch:
-            n = upsert_batch_long(batch)
-            total += n
-            print(f"  upsert +{n} (total={total})")
-            batch.clear()
+            print(f"  linhas baixadas (raw): {total_rows_downloaded}")
+            print(f"  instituições únicas processadas: {len(institutions_seen)}")
+            return total_upserted
 
-        print(f"  linhas baixadas (raw): {row_count}")
-        print(f"  instituições únicas processadas: {len(inst_seen)}")
+        except Exception as e:
+            last_error = e
+            print(f"[WARN] Relatório {rel}: falhou com top={top} a partir de skip={start_skip}. Tentando top menor...")
+            # pequena pausa para aliviar
+            time.sleep(2.0)
 
-    print(f"\nOK. Total de registros upsertados: {total}")
+    raise RuntimeError(f"Relatório {rel}: falhou em todas as tentativas de top. Último erro: {last_error}") from last_error
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description="Ingestão IF.data (LONG) -> ifdata_indicators")
-    ap.add_argument("--anomes", type=int, default=0, help="AAAAMM (ex: 202509). 0 = auto-detect.")
-    ap.add_argument("--tipo", type=int, default=1, help="TipoInstituicao")
-    ap.add_argument("--relatorios", default="1,4,5", help="Relatórios")
-    ap.add_argument("--top", type=int, default=5000, help="Page size")
-    ap.add_argument("--timeout", type=float, default=settings.request_timeout_s)
-    ap.add_argument("--chunk", type=int, default=10000)
-    ap.add_argument("--debug-sample", action="store_true")
+def get_latest_anomes(base: str, timeout_s: float) -> int:
+    # tenta inferir o AnoMes mais recente via cadastro (mais leve)
+    url = CADASTRO_URL.format(base=base)
+    params = {"$format": "json", "$top": 1, "$orderby": "AnoMes desc", "$select": "AnoMes"}
+    data = odata_get(url, params=params, timeout_s=timeout_s)
+    rows = data.get("value", []) or []
+    if not rows:
+        raise RuntimeError("Não consegui detectar AnoMes mais recente via IfDataCadastro.")
+    return int(rows[0]["AnoMes"])
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Ingest IF.data (BCB Olinda) -> ifdata_indicators (long format)")
+
+    ap.add_argument("--odata-base", type=str, default=ODATA_DEFAULT, help="Base URL do OData do IF.data")
+    ap.add_argument("--anomes", type=int, default=0, help="AnoMes (YYYYMM). Se 0, auto-detect pelo cadastro")
+    ap.add_argument("--ref-date", type=str, default="", help="ref_date YYYY-MM-DD. Se vazio, usa último dia do mês do AnoMes")
+    ap.add_argument("--tipo", type=int, default=1, help="TipoInstituicao (ex.: 1)")
+    ap.add_argument("--relatorios", type=str, default="1,4,5", help="Relatórios (ex.: 1,4,5)")
+    ap.add_argument("--top", type=int, default=1000, help="Page size inicial (recomendado 500–1000)")
+    ap.add_argument("--timeout", type=float, default=90.0, help="Timeout base (segundos)")
+
+    ap.add_argument("--state-path", type=str, default=".ifdata_ingest_state.json", help="Arquivo de checkpoint/resume")
+    ap.add_argument("--no-resume", action="store_true", help="Ignora checkpoint e começa do zero")
+
+    ap.add_argument("--commit-every", type=int, default=10000, help="Upsert a cada N registros")
+    ap.add_argument("--indicator-max-len", type=int, default=220, help="Truncagem segura do indicador")
+    ap.add_argument("--name-max-len", type=int, default=160, help="Truncagem segura do nome da instituição")
+
     args = ap.parse_args()
 
-    anomes = int(args.anomes)
+    base = args.odata_base.rstrip("/")
+    timeout_s = float(args.timeout)
     tipo = int(args.tipo)
-    rels = [x.strip() for x in str(args.relatorios).split(",") if x.strip()]
 
-    if anomes == 0:
-        probe = find_working_anomes(relatorio="1", top=int(args.top), timeout_s=float(args.timeout))
-        if probe is None:
-            raise RuntimeError("Auto-detect falhou. Tente passar --anomes manualmente.")
-        anomes, tipo_found = probe
-        if tipo == 1:
-            tipo = tipo_found
+    relatorios = [r.strip() for r in args.relatorios.split(",") if r.strip()]
+    if not relatorios:
+        raise SystemExit("Nenhum relatório informado.")
+
+    anomes = int(args.anomes)
+    if anomes <= 0:
+        anomes = get_latest_anomes(base=base, timeout_s=timeout_s)
         print(f"[INFO] Auto-detect: AnoMes={anomes}, TipoInstituicao={tipo}")
 
-    run(
-        anomes=anomes,
-        tipo=tipo,
-        relatorios=rels,
-        top=int(args.top),
-        timeout_s=float(args.timeout),
-        chunk=int(args.chunk),
-        debug_sample=bool(args.debug_sample),
-    )
+    if args.ref_date.strip():
+        ref_date = datetime.strptime(args.ref_date.strip(), "%Y-%m-%d").date()
+    else:
+        ref_date = parse_ref_date_from_anomes(anomes)
+
+    print(f"==> Ingest IF.data: AnoMes={anomes} ref_date={ref_date} tipo={tipo} relatorios={relatorios}")
+    print(f"ODATA_BASE={base}")
+
+    state_path = Path(args.state_path)
+    resume = not bool(args.no_resume)
+
+    # carrega cadastro uma vez por execução
+    cadastro_map = build_cadastro_map(anomes=anomes, tipo=tipo, base=base, timeout_s=timeout_s)
+
+    total = 0
+    for rel in relatorios:
+        print(f"\n--- Relatório {rel} ---")
+        n = ingest_relatorio(
+            anomes=anomes,
+            ref_date=ref_date,
+            tipo=tipo,
+            rel=rel,
+            base=base,
+            timeout_s=timeout_s,
+            top_initial=int(args.top),
+            cadastro_map=cadastro_map,
+            state_path=state_path,
+            resume=resume,
+            commit_every=int(args.commit_every),
+            indicator_max_len=int(args.indicator_max_len),
+            name_max_len=int(args.name_max_len),
+        )
+        total += n
+
+    print(f"\nOK. Total de registros upsertados: {total}")
 
 
 if __name__ == "__main__":
