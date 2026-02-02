@@ -224,9 +224,9 @@ else:
 
 with left:
     st.subheader("Visão geral")
-    st.altair_chart(chart_rating, use_container_width=True)
+    st.altair_chart(chart_rating, width="stretch")
     if chart_score is not None:
-        st.altair_chart(chart_score, use_container_width=True)
+        st.altair_chart(chart_score, width="stretch")
     else:
         st.info("Sem scores calculados. Rode `poetry run python -m pipelines.risk_score --ref-date ...`.")
 
@@ -246,7 +246,7 @@ with right:
             )
             .properties(height=220)
         )
-        st.altair_chart(chart1, use_container_width=True)
+        st.altair_chart(chart1, width="stretch")
     else:
         st.caption("Scatter Basileia x Score indisponível (dados insuficientes).")
 
@@ -262,7 +262,7 @@ with right:
             )
             .properties(height=220)
         )
-        st.altair_chart(chart2, use_container_width=True)
+        st.altair_chart(chart2, width="stretch")
     else:
         st.caption("Scatter Alavancagem x ROA indisponível (dados insuficientes).")
 
@@ -300,7 +300,7 @@ st.dataframe(
     table.style
         .apply(style_row, axis=1)
         .bar(subset=["score"], vmin=0, vmax=100),
-    use_container_width=True,
+    width="stretch",
     hide_index=True
 )
 
@@ -363,8 +363,8 @@ with b:
             )
             .properties(height=220)
         )
-        st.altair_chart(chart_drv, use_container_width=True)
-        st.dataframe(ddf, use_container_width=True, hide_index=True)
+        st.altair_chart(chart_drv, width="stretch")
+        st.dataframe(ddf, width="stretch", hide_index=True)
 
 st.divider()
 

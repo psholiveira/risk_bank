@@ -22,6 +22,7 @@ ODATA_DEFAULT = "https://olinda.bcb.gov.br/olinda/servico/IFDATA/versao/v1/odata
 CADASTRO_URL = "{base}/IfDataCadastro"
 VALORES_FUNCTION_URL = "{base}/IfDataValores(AnoMes=@AnoMes,TipoInstituicao=@TipoInstituicao,Relatorio=@Relatorio)"
 
+
 # -----------------------------
 # Text cleaning / normalization
 # -----------------------------
@@ -54,7 +55,6 @@ def to_float(x: Any) -> Optional[float]:
             x = x.strip()
             if x == "":
                 return None
-            # tenta normalizar "1.234,56"
             if "," in x and "." in x:
                 x = x.replace(".", "").replace(",", ".")
             elif "," in x and "." not in x:
@@ -72,15 +72,22 @@ def parse_ref_date_from_anomes(anomes: int) -> date:
         next_month = date(y, m + 1, 1)
     return date.fromordinal(next_month.toordinal() - 1)
 
+
 # -----------------------------
 # Resilient HTTP (Olinda)
 # -----------------------------
 def odata_get(
     url: str,
     params: Dict[str, Any],
-    timeout_s: float = 90.0,
-    tries: int = 8,
+    timeout_s: float = 120.0,
+    tries: int = 6,
 ) -> Dict[str, Any]:
+    """
+    GET resiliente:
+    - retry com backoff exponencial + jitter
+    - trata 429/5xx/timeouts
+    - se 400: não adianta retry infinito (é query inválida); retorna erro rápido
+    """
     last_err: Exception | None = None
 
     timeout = httpx.Timeout(
@@ -92,7 +99,7 @@ def odata_get(
 
     headers = {
         "Accept": "application/json",
-        "User-Agent": "risk-bank-ingest/1.1",
+        "User-Agent": "risk-bank-ingest/1.2",
     }
 
     for attempt in range(1, tries + 1):
@@ -106,6 +113,16 @@ def odata_get(
                     time.sleep(sleep_s)
                     continue
 
+                # 400 normalmente é erro de query -> não vale insistir demais
+                if r.status_code == 400:
+                    # tenta dar um pouco de contexto sem floodar
+                    snippet = (r.text or "")[:500]
+                    raise httpx.HTTPStatusError(
+                        f"400 Bad Request. Body(snippet)={snippet}",
+                        request=r.request,
+                        response=r,
+                    )
+
                 if 500 <= r.status_code <= 599:
                     raise httpx.HTTPStatusError(
                         f"{r.status_code} server error", request=r.request, response=r
@@ -118,14 +135,18 @@ def odata_get(
             last_err = e
         except httpx.HTTPStatusError as e:
             last_err = e
+            # se for 400, não adianta retry longo
+            if "400" in str(e):
+                break
         except Exception as e:
             last_err = e
 
-        base = min(2 ** attempt, 60)
-        jitter = random.uniform(0.4, 1.3)
+        base = min(2 ** attempt, 40)
+        jitter = random.uniform(0.4, 1.2)
         time.sleep(base * jitter)
 
     raise RuntimeError(f"Falha no GET {url} params={params}. Último erro: {last_err}") from last_err
+
 
 # -----------------------------
 # Checkpoint / resume
@@ -181,94 +202,78 @@ def set_checkpoint(state: Dict[str, Any], cp: Checkpoint) -> None:
         "updated_at": cp.updated_at,
     }
 
+
 # -----------------------------
-# IF.data: Cadastro com fallback (evita 400)
+# Cadastro (ANTI-400): SEM $filter/$select/$orderby
 # -----------------------------
-def iter_cadastro(anomes: int, tipo: int, base: str, timeout_s: float) -> Iterator[Dict[str, Any]]:
+def iter_cadastro_raw(base: str, timeout_s: float) -> Iterator[Dict[str, Any]]:
     """
-    Tenta com $filter. Se der 400 no Olinda, faz fallback sem $filter e filtra no Python.
+    Busca IfDataCadastro do jeito MAIS compatível possível:
+    apenas $format, $top, $skip.
     """
     url = CADASTRO_URL.format(base=base)
-    top = 5000
-
-    def _with_filter() -> Iterator[Dict[str, Any]]:
-        skip = 0
-        while True:
-            params = {
-                "$format": "json",
-                "$top": top,
-                "$skip": skip,
-                "$select": "AnoMes,CodInst,Nome,TipoInstituicao",
-                "$filter": f"AnoMes eq {anomes} and TipoInstituicao eq {tipo}",
-            }
-            data = odata_get(url, params=params, timeout_s=timeout_s)
-            rows = data.get("value", []) or []
-            if not rows:
-                break
-            for r in rows:
-                yield r
-            skip += len(rows)
-            if len(rows) < top:
-                break
-
-    def _without_filter() -> Iterator[Dict[str, Any]]:
-        skip = 0
-        while True:
-            params = {
-                "$format": "json",
-                "$top": top,
-                "$skip": skip,
-                "$select": "AnoMes,CodInst,Nome,TipoInstituicao",
-                "$orderby": "AnoMes desc",
-            }
-            data = odata_get(url, params=params, timeout_s=timeout_s)
-            rows = data.get("value", []) or []
-            if not rows:
-                break
-
-            for r in rows:
-                try:
-                    if int(r.get("AnoMes")) == int(anomes) and int(r.get("TipoInstituicao")) == int(tipo):
-                        yield r
-                except Exception:
-                    continue
-
-            skip += len(rows)
-            if len(rows) < top:
-                break
-
-    try:
-        yield from _with_filter()
-    except Exception as e:
-        msg = str(e)
-        if "400" in msg or "Bad Request" in msg:
-            print("[WARN] IfDataCadastro rejeitou $filter (400). Fallback sem $filter (filtrando no Python)...")
-            yield from _without_filter()
-        else:
-            raise
+    top = 2000
+    skip = 0
+    while True:
+        params = {"$format": "json", "$top": top, "$skip": skip}
+        data = odata_get(url, params=params, timeout_s=timeout_s)
+        rows = data.get("value", []) or []
+        if not rows:
+            break
+        for r in rows:
+            yield r
+        skip += len(rows)
+        if len(rows) < top:
+            break
 
 def build_cadastro_map(anomes: int, tipo: int, base: str, timeout_s: float) -> Dict[str, str]:
+    """
+    Monta CodInst -> Nome filtrando no Python (AnoMes e TipoInstituicao).
+    """
     print("==> Carregando cadastro (CodInst -> Nome)...")
+
     cmap: Dict[str, str] = {}
-    for r in iter_cadastro(anomes=anomes, tipo=tipo, base=base, timeout_s=timeout_s):
+    matched = 0
+    total = 0
+
+    for r in iter_cadastro_raw(base=base, timeout_s=timeout_s):
+        total += 1
+        try:
+            if int(r.get("AnoMes")) != int(anomes):
+                continue
+            if int(r.get("TipoInstituicao")) != int(tipo):
+                continue
+        except Exception:
+            continue
+
         cod = str(r.get("CodInst") or "").strip()
         nome = clean_text(str(r.get("Nome") or ""))
+
         if cod:
             cmap[cod] = nome
-    print(f"    cadastro_map size: {len(cmap)}")
+            matched += 1
+
+    print(f"    cadastro_raw rows: {total}")
+    print(f"    cadastro_map size: {len(cmap)} (matches={matched})")
     return cmap
 
 def get_latest_anomes(base: str, timeout_s: float) -> int:
     """
-    Detecção tolerante: evita combinações de $select que às vezes dão 400.
+    Detecção do AnoMes mais recente sem depender de $orderby.
+    Varre cadastro e pega o max(AnoMes).
     """
-    url = CADASTRO_URL.format(base=base)
-    params = {"$format": "json", "$top": 1, "$orderby": "AnoMes desc"}
-    data = odata_get(url, params=params, timeout_s=timeout_s)
-    rows = data.get("value", []) or []
-    if not rows:
-        raise RuntimeError("Não consegui detectar AnoMes mais recente via IfDataCadastro.")
-    return int(rows[0]["AnoMes"])
+    max_anomes = 0
+    for r in iter_cadastro_raw(base=base, timeout_s=timeout_s):
+        try:
+            a = int(r.get("AnoMes"))
+            if a > max_anomes:
+                max_anomes = a
+        except Exception:
+            continue
+    if max_anomes <= 0:
+        raise RuntimeError("Não consegui detectar AnoMes (max) via IfDataCadastro raw.")
+    return max_anomes
+
 
 # -----------------------------
 # IF.data: Valores (function)
@@ -304,6 +309,7 @@ def iter_ifdata_valores_pages(
         if len(rows) < top:
             break
 
+
 # -----------------------------
 # DB: upsert
 # -----------------------------
@@ -325,8 +331,9 @@ def upsert_batch(batch: List[Dict[str, Any]]) -> int:
         conn.execute(UPSERT_SQL, batch)
     return len(batch)
 
+
 # -----------------------------
-# Ingest de um relatório (com fallback top + checkpoint)
+# Ingest relatório (fallback top + checkpoint)
 # -----------------------------
 def ingest_relatorio(
     anomes: int,
@@ -341,9 +348,9 @@ def ingest_relatorio(
     resume: bool,
     commit_every: int = 10_000,
     indicator_max_len: int = 220,
-    name_max_len: int = 160,
+    name_max_len: int = 200,
 ) -> int:
-    top_candidates = [top_initial, 2000, 1000, 500, 200, 100]
+    top_candidates = [top_initial, 1000, 500, 200, 100]
     top_candidates = [t for t in top_candidates if t > 0]
     top_candidates = list(dict.fromkeys(top_candidates))
 
@@ -371,7 +378,6 @@ def ingest_relatorio(
                 timeout_s=timeout_s,
             ):
                 if not rows:
-                    # checkpoint final
                     state = load_state(state_path)
                     set_checkpoint(
                         state,
@@ -395,10 +401,9 @@ def ingest_relatorio(
                         continue
 
                     nome_inst = cadastro_map.get(codinst) or clean_text(str(r.get("NomeInstituicao") or "")) or ""
+
                     nome_coluna = r.get("NomeColuna") or r.get("DescricaoColuna") or ""
                     indicator = f"{rel}::{clean_indicator_name(str(nome_coluna))}"
-
-                    # Evita indicador vazio
                     if indicator.strip() == f"{rel}::":
                         continue
 
@@ -433,7 +438,6 @@ def ingest_relatorio(
                         )
                         save_state(state_path, state)
 
-                # checkpoint por página (skip + rows)
                 state = load_state(state_path)
                 set_checkpoint(
                     state,
@@ -463,29 +467,34 @@ def ingest_relatorio(
 
     raise RuntimeError(f"Relatório {rel}: falhou em todas as tentativas de top. Último erro: {last_error}") from last_error
 
+
 # -----------------------------
 # CLI
 # -----------------------------
 def main():
     ap = argparse.ArgumentParser(description="Ingest IF.data (BCB Olinda) -> ifdata_indicators (long format)")
+
     ap.add_argument("--odata-base", type=str, default=ODATA_DEFAULT)
-    ap.add_argument("--anomes", type=int, default=0, help="AnoMes (YYYYMM). Se 0, auto-detect.")
+    ap.add_argument("--anomes", type=int, default=0, help="AnoMes (YYYYMM). Se 0, auto-detect (max em cadastro raw).")
     ap.add_argument("--ref-date", type=str, default="", help="YYYY-MM-DD. Se vazio, último dia do mês do AnoMes.")
-    ap.add_argument("--tipo", type=int, default=1, help="TipoInstituicao (ex.: 1)")
-    ap.add_argument("--relatorios", type=str, default="1,4,5", help="Relatórios (ex.: 1,4,5)")
-    ap.add_argument("--top", type=int, default=1000, help="Page size inicial (recomendado 500–1000)")
-    ap.add_argument("--timeout", type=float, default=120.0, help="Timeout base em segundos")
+    ap.add_argument("--tipo", type=int, default=1)
+    ap.add_argument("--relatorios", type=str, default="1,4,5")
+    ap.add_argument("--top", type=int, default=500)
+    ap.add_argument("--timeout", type=float, default=150.0)
+
     ap.add_argument("--state-path", type=str, default=".ifdata_ingest_state.json")
-    ap.add_argument("--no-resume", action="store_true", help="Ignora checkpoint e começa do zero")
+    ap.add_argument("--no-resume", action="store_true")
     ap.add_argument("--commit-every", type=int, default=10000)
+
     ap.add_argument("--indicator-max-len", type=int, default=220)
-    ap.add_argument("--name-max-len", type=int, default=160)
+    ap.add_argument("--name-max-len", type=int, default=200)
 
     args = ap.parse_args()
 
     base = args.odata_base.rstrip("/")
     timeout_s = float(args.timeout)
     tipo = int(args.tipo)
+
     relatorios = [r.strip() for r in args.relatorios.split(",") if r.strip()]
 
     anomes = int(args.anomes)
@@ -504,6 +513,7 @@ def main():
     state_path = Path(args.state_path)
     resume = not bool(args.no_resume)
 
+    # CADASTRO (raw) - sem $filter/$select/$orderby para evitar 400
     cadastro_map = build_cadastro_map(anomes=anomes, tipo=tipo, base=base, timeout_s=timeout_s)
 
     total = 0
@@ -527,6 +537,7 @@ def main():
         total += n
 
     print(f"\nOK. Total de registros upsertados: {total}")
+
 
 if __name__ == "__main__":
     main()
